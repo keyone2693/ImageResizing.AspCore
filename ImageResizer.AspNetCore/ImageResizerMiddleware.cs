@@ -1,4 +1,4 @@
-﻿using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
@@ -13,6 +13,8 @@ using ImageResizer.AspNetCore.Funcs;
 using Newtonsoft.Json;
 using ImageResizer.AspNetCore.Models;
 using Microsoft.Extensions.FileProviders;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace ImageResizer.AspNetCore
 {
@@ -25,6 +27,8 @@ namespace ImageResizer.AspNetCore
         private readonly IFileProvider _fileProvider;
         private WatermarkTextModel watermarkText;
         private WatermarkImageModel watermarkImage;
+        private const bool CACHE_MEMORY = false;
+        private const bool CACHE_DISK = true;
 
         private static readonly string[] suffixes = new string[] {
             ".png",
@@ -33,9 +37,9 @@ namespace ImageResizer.AspNetCore
         };
 
         public ImageResizerMiddleware(
-            RequestDelegate req, 
-            IWebHostEnvironment env, 
-            ILogger<ImageResizerMiddleware> logger, 
+            RequestDelegate req,
+            IWebHostEnvironment env,
+            ILogger<ImageResizerMiddleware> logger,
             IMemoryCache memoryCache,
             IFileProvider fileProvider)
         {
@@ -95,9 +99,8 @@ namespace ImageResizer.AspNetCore
                 }
             }
 
-            // if we got this far, resize it
-            _logger.LogInformation($"Resizing {path.Value} with params {resizeParams}");
-            var imagePath = _fileProvider.GetFileInfo(path.Value).PhysicalPath; 
+            // if we got this far, resize it            
+            var imagePath = _fileProvider.GetFileInfo(path.Value).PhysicalPath;
             //// get the image location on disk
             //var imagePath = Path.Combine(
             //    rootPath.Replace("\\wwwroot", ""),
@@ -111,33 +114,57 @@ namespace ImageResizer.AspNetCore
                 return;
             }
 
-            var imageData = GetImageData(imagePath, resizeParams, lastWriteTimeUtc);
+            var imageData = await GetImageData(imagePath, resizeParams, lastWriteTimeUtc);
 
             // write to stream
             context.Response.ContentType = resizeParams.format == "png" ? "image/png" : "image/jpeg";
             context.Response.ContentLength = imageData.Size;
+
+            // Configure caching for static files
+            //const int durationInSeconds = 60 * 60 * 24 * 30; // 30 days
+            //context.Response.Headers[Microsoft.Net.Http.Headers.HeaderNames.CacheControl] =
+            //    "public,max-age=" + durationInSeconds;
+            //context.Response.Headers[Microsoft.Net.Http.Headers.HeaderNames.Expires] =
+            //    new[] { (DateTime.UtcNow.AddSeconds(durationInSeconds)).ToString("R") }; // RFC1123 format
+
             await context.Response.Body.WriteAsync(imageData.ToArray(), 0, (int)imageData.Size);
 
             // cleanup
             imageData.Dispose();
 
         }
-        private SKData GetImageData(string imagePath, ResizeParams resizeParams, DateTime lastWriteTimeUtc)
+        private async Task<SKData> GetImageData(string imagePath, ResizeParams resizeParams, DateTime lastWriteTimeUtc)
         {
             // check cache and return if cached
-            long cacheKey;
+            string cacheKey;
             unchecked
             {
-                cacheKey = imagePath.GetHashCode() + lastWriteTimeUtc.ToBinary() + resizeParams.ToString().GetHashCode();
+                //+ lastWriteTimeUtc.ToBinary()
+                cacheKey = CreateMD5(imagePath + resizeParams.ToString());
             }
 
             SKData imageData;
-            bool isCached = _memoryCache.TryGetValue(cacheKey, out byte[] imageBytes);
-            if (isCached)
+            var diskCachedPath = "";
+            if (CACHE_MEMORY)
             {
-                _logger.LogInformation("Serving from cache");
+                bool isCached = _memoryCache.TryGetValue(cacheKey, out byte[] imageBytes);
+                _logger.LogInformation("Serving from memory cache");
                 return SKData.CreateCopy(imageBytes);
             }
+            else if (CACHE_DISK)
+            {
+                var ext = Path.GetExtension(imagePath);
+                var name = Path.GetFileNameWithoutExtension(imagePath);
+                var nameWithExt = Path.GetFileName(imagePath);
+                diskCachedPath = imagePath.Replace(nameWithExt, $"{name}_cached_{cacheKey}{ext}");
+                if (File.Exists(diskCachedPath))
+                {
+                    _logger.LogInformation("Serving from disk cache");
+                    return SKData.CreateCopy(await File.ReadAllBytesAsync(diskCachedPath));
+                }
+            }
+
+            _logger.LogInformation($"Resizing {imagePath} with params {resizeParams}");
 
             using (var fs = File.OpenRead(imagePath))
             {
@@ -210,9 +237,16 @@ namespace ImageResizer.AspNetCore
                 var encodeFormat = resizeParams.format == "png" ? SKEncodedImageFormat.Png : SKEncodedImageFormat.Jpeg;
                 imageData = resizedImage.Encode(encodeFormat, resizeParams.quality);
 
-                // cache the result
-                _memoryCache.Set(cacheKey, imageData.ToArray());
-
+                if (CACHE_MEMORY)
+                {
+                    // cache the result
+                    _memoryCache.Set(cacheKey, imageData.ToArray());
+                }
+                else if (CACHE_DISK)
+                {
+                    //disk cache
+                    await File.WriteAllBytesAsync(diskCachedPath, imageData.ToArray());
+                }
                 // cleanup
                 resizedImage.Dispose();
                 bitmap.Dispose();
@@ -221,7 +255,25 @@ namespace ImageResizer.AspNetCore
                 return imageData;
             }
         }
+        private string CreateMD5(string input)
+        {
+            // Use input string to calculate MD5 hash
+            using (System.Security.Cryptography.MD5 md5 = System.Security.Cryptography.MD5.Create())
+            {
+                byte[] inputBytes = System.Text.Encoding.ASCII.GetBytes(input);
+                byte[] hashBytes = md5.ComputeHash(inputBytes);
 
+                //return Convert.ToHexString(hashBytes); // .NET 5 +
+
+                //Convert the byte array to hexadecimal string prior to.NET 5
+                StringBuilder sb = new System.Text.StringBuilder();
+                for (int i = 0; i < hashBytes.Length; i++)
+                {
+                    sb.Append(hashBytes[i].ToString("X2"));
+                }
+                return sb.ToString();
+            }
+        }
         private SKBitmap LoadBitmap(Stream stream, out SKEncodedOrigin origin)
         {
             using (var s = new SKManagedStream(stream))
@@ -277,7 +329,7 @@ namespace ImageResizer.AspNetCore
             if (query.ContainsKey("autorotate"))
                 bool.TryParse(query["autorotate"], out resizeParams.autorotate);
 
-            int quality = 100;
+            int quality = 80;
             if (query.ContainsKey("quality"))
                 int.TryParse(query["quality"], out quality);
             resizeParams.quality = quality;
